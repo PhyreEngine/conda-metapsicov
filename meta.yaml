@@ -1,0 +1,68 @@
+{% set name = "metapsicov" %}
+{% set version = load_file_regex(
+    load_file="VERSION",
+    regex_pattern='^(\S+)$',
+    from_recipe_dir=False).group(1) %}
+
+package:
+  name: {{ name | lower }}
+  version: {{ version }}
+
+source:
+  - url: http://bioinfadmin.cs.ucl.ac.uk/downloads/MetaPSICOV/metapsicov2.tar.gz
+    sha256: 03944dc7ce634c52b72a67774b8495e6881bac9703aabfb53901dd284d811576
+  - url: http://bioinfadmin.cs.ucl.ac.uk/downloads/MetaPSICOV/VERSION
+    sha256: be695fc8092ad3706d7d7d3b5104e1eaf8fe69666e5958e375c9952a06fa9514
+  - path: run_metapsicov
+
+build:
+  number: {{ environ.get("BUILD_NUMBER", 0) }}
+  script: |
+    make -C src CC="${CC}" CFLAGS="${CFLAGS}"
+
+    install -d -m755 "$PREFIX/bin"
+    install -m755 \
+        run_metapsicov \
+        src/metapsicov \
+        src/metapsicovp2 \
+        src/metapsicovhb \
+        src/alnstats \
+        src/solvpred \
+        "$PREFIX/bin"
+
+    install -d -m755 "$PREFIX/share/metapsicov/data"
+    install -m644 \
+        data/weights_1012A.dat \
+        data/weights_65A.dat \
+        data/weights_75A.dat \
+        data/weights_811A.dat \
+        data/weights_8A.dat \
+        data/weights_hbpass2.dat \
+        data/weights_solv.dat \
+        data/weights_10A.dat \
+        data/weights_6A.dat \
+        data/weights_7A.dat \
+        data/weights_85A.dat \
+        data/weights_9A.dat \
+        data/weights_pass2.dat \
+        "$PREFIX/share/metapsicov/data"
+
+requirements:
+  build:
+    - make
+    - {{ compiler('c') }}
+  run:
+    - arch
+    - perl
+    - perl-try-tiny
+    - psipred
+    - freecontact
+    - ccmpred
+    - hhsuite
+    - hmmer
+    - psicov
+    - blast-legacy
+
+about:
+  home: http://bioinf.cs.ucl.ac.uk/MetaPSICOV/
+  license: GPL2

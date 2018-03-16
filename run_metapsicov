@@ -1,0 +1,553 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+# Script to execute CONSIP3 CASP prediction
+# Original written by David Jones in 1998
+# Current version written by David Jones in April 2016
+# Heavily modified by Stefans Mezulis (Imperial College) for conda packaging, March 2018.
+
+=head1 NAME
+
+run_metapsicov - Run metapsicov with all components
+
+=head1 USAGE
+
+run_metapsicov QUERY_SEQ UNIREF90 UNIREF100 HHBLITS_DB PDB70
+
+run_metapsicov --help
+
+=head1 OPTIONS AND ARGUMENTS
+
+The following arguments are mandatory:
+
+=over
+
+=item B<QUERY_SEQ>
+
+Fasta file containing the query sequence.
+
+=item B<UNIREF90>
+
+Path to the Uniref90 database.
+
+=item B<UNIREF100>
+
+Path to the Uniref100 database (e.g. L<uniclust30|http://wwwuser.gwdg.de/~compbiol/uniclust/2017_10/>).
+
+=item B<HHBLITS_DB>
+
+Path to an hhblits database.
+
+=item B<HHBLITS_PDB70_DB>
+
+Path to the
+L<pdb70|http://wwwuser.gwdg.de/~compbiol/data/hhsuite/databases/hhsuite_dbs/pdb70_from_mmcif_latest.tar.gz>
+hhblits database.
+
+=back
+
+The following options may also be supplied:
+
+=over
+
+=item B<-j>, B<--job-id>=I<ID>
+
+Set Job ID (used as a prefix) to I<ID>.
+
+=item B<-k>, B<--keep-tempfiles>
+
+Keep temporary files.
+
+=item B<-n>, B<--cpu>=I<N>
+
+Use I<N> threads (default: 4).
+
+=item B<-w>, B<--work-dir>=I<DIR>
+
+Use an existing workspace directory rather than creating one from scratch.
+
+=item B<-h>, B<--help>
+
+Display this usage message.
+
+=back
+
+=cut
+
+use autodie;
+use Getopt::Long;
+use Pod::Usage;
+use Cwd;
+use Digest::MD5 qw(md5_hex);
+use IO::Handle;
+use Text::Wrap;
+use File::Basename;
+use File::Copy;
+use File::Temp;
+use Capture::Tiny qw(capture);
+
+my $prefix_dir = "/opt/anaconda1anaconda2anaconda3";
+my $bin_dir = "$prefix_dir/bin";
+my $share_dir = "$prefix_dir/share";
+
+# bioconda places blast data in root
+$ENV{'BLASTMAT'} = "$prefix_dir/data/";
+$ENV{'HHLIB'} = "$share_dir/hhsuite/";
+
+my %options = (
+    job_id => "query",
+    keep_tempfiles => 0,
+    cpu => 1,
+);
+Getopt::Long::Configure(qw(bundling no_ignore_case));
+GetOptions(\%options,
+    'job_id|job-id|j=s',
+    'keep_tempfiles|keep-tempfiles|k',
+    'help|h',
+    'cpu|n=i',
+    'work_dir|work-dir|w=s',
+) or pod2usage(2);
+pod2usage(-verbose => 2, -noperldoc => 1, -exitval => 1) if $options{help};
+
+my $query_seq = shift || pod2usage("No query sequence provided.");
+my $uniref90 = shift || pod2usage("Path to uniref90 not given.");
+my $uniref100 = shift || pod2usage("Path to uniref100 not given.");
+my $hhdb = shift || pod2usage("Path to hhblits sequence database not given.");
+my $pdb70 = shift || pod2usage("Path to hhblits pdb70 database not given.");
+
+my $tempdir;
+if(!$options{work_dir}){
+    $tempdir = File::Temp::tempdir(
+        "metapsicov-XXXXXXXX",
+        DIR => getcwd,
+        CLEANUP => !$options{keep_tempfiles});
+}else{
+    $tempdir= $options{work_dir};
+}
+my $jobid = $options{job_id};
+my @contacts;
+
+sub run {
+    # Run command using (list form) system, capturing output. If $redirect is
+    # given, all standard output is redirected to that file.
+    # Pass "ignore_exitval" to ignore a non-zero exit value.
+    # Unless "cache" is false, this will not actually override any files
+    # pointed to by redirect.
+    my ($cmd, %opts) = @_;
+    $opts{cache} //= 1;
+    $opts{verbose} //= 1;
+    print STDERR "Running @{$cmd}\n" if $opts{verbose};
+
+    if($opts{cache} && $opts{redirect} && (-s $opts{redirect})){
+        open my $stdout_input, q{<}, $opts{redirect};
+        my $stdout = do {local $/=undef; <$stdout_input>};
+        close $stdout_input;
+        return ($stdout, "", 0);
+    }
+
+    my ($stdout, $stderr, $exit) = capture { system @{$cmd} };
+    if($exit != 0 && !$opts{ignore_exitval}){
+        print STDERR "Error running `@{$cmd}' (exit status: $exit).\n";
+        print STDERR "Standard error:\n$stderr\n" if $stderr;
+        die;
+    }
+
+    if($opts{redirect}){
+        open my $out, q{>}, $opts{redirect};
+        print {$out} $stdout;
+        close $out;
+    }
+    return ($stdout, $stderr, $exit);
+}
+
+sub RunMetaPSICOV
+{
+  my($prefix) = @_;
+  print("Running: blastpgp\n");
+  run(["$bin_dir/blastpgp",
+          -a => $options{cpu},
+          -b => 0,
+          -v => 2000,
+          -j => 3,
+          -h => 0.001,
+          -e => 0.001,
+          -d => $uniref90,
+          -i => "$tempdir/$prefix.fasta",
+          -C => "$tempdir/$jobid.chk"
+      ], redirect => "$tempdir/$jobid.blast");
+
+  do {
+    open my $mmout, q{>}, "$tempdir/$jobid.pn";
+    print {$mmout} "$jobid.chk";
+    close $mmout;
+  };
+  do {
+    open my $mmout, q{>}, "$tempdir/$jobid.sn";
+    print {$mmout} "$prefix.fasta";
+    close $mmout;
+  };
+
+  run(["$bin_dir/makemat", -P => "$tempdir/$jobid"]);
+  run(["$bin_dir/hhblits",
+          -i => "$tempdir/$prefix.fasta",
+          -n => 3,
+          -e => 0.001,
+          -d => $hhdb,
+          -cpu => $options{cpu},
+          -oa3m => "$tempdir/$prefix.a3m",
+          -diff => "inf",
+          -cov => 50,
+          -id => 99,
+      ], redirect => "$tempdir/$prefix.hhblog");
+
+
+  open my $a3m_in, q{<}, "$tempdir/$prefix.a3m";
+  open my $hhaln_out, q{>}, "$tempdir/$prefix.hhbaln";
+  while(my $ln = <$a3m_in>) {
+      next if $ln =~ /^>/;
+      $ln =~ s/[a-z]//g;
+      print {$hhaln_out} $ln;
+  }
+  close $hhaln_out;
+  close $a3m_in;
+
+  my ($naln_hhblits) = run(["cat '$tempdir/$prefix.hhbaln' | wc -l"]);
+
+  my $naln_jack = 0;
+  if ($naln_hhblits < 3000)
+  {
+    # Scan query against uniref100 with jackhmmer
+    run(["$bin_dir/jackhmmer",
+        "--cpu" => $options{cpu},
+        -N => 3,
+        -E => 10,
+        "--incE" => 1e-3,
+        "--noali",
+        "--tblout" => "$tempdir/$prefix.tbl",
+        "$tempdir/$prefix.fasta",
+        $uniref100
+      ]) unless (-s "$tempdir/$prefix.tbl");
+
+    # Fetch sequences of results
+    run(["$bin_dir/esl-sfetch",
+        -f => $uniref100,
+        "$tempdir/$prefix.tbl"
+      ], redirect => "$tempdir/$prefix.fseqs");
+
+    # Append query to list of sequences. Do this in an idempotent
+    # way by first checking to see if the query is already present.
+    open my $seqs_out, q{+<}, "$tempdir/$prefix.fseqs";
+    open my $seq_in, q{<}, "$tempdir/$prefix.fasta";
+
+    my @query_lines = <$seq_in>;
+    my $query_present = 0;
+    while(my $ln = <$seqs_out>){
+      if($ln eq $query_lines[0]){
+        $query_present++;
+        last;
+      }
+    }
+    if(!$query_present) {
+      for my $ln(@query_lines){
+        print {$seqs_out} $ln;
+      }
+    }
+    close $seq_in;
+    close $seqs_out;
+
+    # Split sequences into many a3m files
+    my $split_a3m_dir = "$tempdir/$prefix-mya3m";
+    mkdir $split_a3m_dir if !(-e $split_a3m_dir);
+    open my $seqs_in, q{<}, "$tempdir/$prefix.fseqs";
+    do {
+      local $/ = "\n>";
+      while(my $jack_seq = <$seqs_in>){
+        if($jack_seq =~ /^\s*(\S+)/){
+          chomp $jack_seq;
+
+          open my $a3m_out, q{>}, "$split_a3m_dir/$1.a3m";
+          print {$a3m_out} ">$jack_seq";
+          close $a3m_out;
+        }
+      }
+    };
+    close $seqs_in;
+
+    # Generate an hhblits database from the split a3m files
+    my $jack_blits_db = "$tempdir/$prefix-mydb";
+    mkdir $jack_blits_db if !(-e $jack_blits_db);
+    run(["$share_dir/hhsuite/scripts/hhsuitedb.py",
+        "--cpu" => $options{cpu},
+        -o => "$jack_blits_db/mydb",
+        "--ia3m" => "$split_a3m_dir/*.a3m",
+      ]) unless (-s "$jack_blits_db/mydb_a3m.ffdata");
+
+    # Run hhblits against new library (unless we've already done so).
+    if(!(-s "$tempdir/$prefix.a3m.pre-jack")) {
+      copy("$tempdir/$prefix.a3m", "$tempdir/$prefix.a3m.pre-jack");
+      run(["$bin_dir/hhblits",
+          -i => "$tempdir/$prefix.a3m",
+          -d => "$jack_blits_db/mydb",
+          -oa3m => "$tempdir/$prefix.a3m",
+          -e => 1e-3,
+          -n => 3,
+          -cpu => $options{cpu},
+          -diff => "inf",
+          -id => 99,
+          -cov => 50
+        ]);
+    }
+
+    # Remove deletions from output a3m
+    open my $jack_a3m_in, q{<}, "$tempdir/$prefix.a3m";
+    open my $jackaln_out, q{>}, "$tempdir/$prefix.jackaln";
+    while(my $jack_seq = <$jack_a3m_in>){
+      next if $jack_seq =~ /^>/;
+      $jack_seq =~ s/[a-z]//g;
+      print {$jackaln_out} $jack_seq;
+    }
+    close $jackaln_out;
+    close $jack_a3m_in;
+
+    ($naln_jack) = run(["cat $tempdir/$prefix.jackaln | wc -l"]);
+  }
+
+  if ($naln_jack > $naln_hhblits)
+  {
+    copy("$tempdir/$prefix.jackaln", "$tempdir/$prefix.aln");
+  }
+  else
+  {
+    copy("$tempdir/$prefix.hhbaln", "$tempdir/$prefix.aln");
+  }
+
+  print("Running: psipred\n");
+  run(["$bin_dir/psipred", "$tempdir/$jobid.mtx",
+      "$share_dir/psipred/data/weights.dat",
+      "$share_dir/psipred/data/weights.dat2",
+      "$share_dir/psipred/data/weights.dat3"
+    ], redirect => "$tempdir/$jobid.ss");
+  run(["$bin_dir/psipass2", "$share_dir/psipred/data/weights_p2.dat",
+      "1", "1.0", "1.0",
+      "$tempdir/$prefix.ss2",
+      "$tempdir/$jobid.ss"
+    ]);
+
+  run(["$bin_dir/solvpred",
+      "$tempdir/$jobid.mtx",
+      "$share_dir/metapsicov/data/weights_solv.dat",
+    ], redirect => "$tempdir/$prefix.solv");
+  run(["$bin_dir/alnstats",
+      "$tempdir/$prefix.aln",
+      "$tempdir/$prefix.colstats",
+      "$tempdir/$prefix.pairstats"
+    ]) unless (-s "$tempdir/$prefix.colstats");
+
+  my ($naln) = run(["cat $tempdir/$prefix.aln | wc -l"]);
+  print("Running: Making contact predictions\n");
+  if ($naln >= 10)
+  {
+    my ($stdout, $stderr, $exit);
+    my $psicov_cmd = [
+        "timeout", "86400",
+        "$bin_dir/psicov", -z => 6, "-o", -d => 0.03,
+        "$tempdir/$prefix.aln"];
+
+    ($stdout, $stderr, $exit) = run(
+      $psicov_cmd,
+      redirect => "$tempdir/$prefix.psicov",
+      ignore_exitval => 1);
+
+    # Ignore timeout (exit == 124)
+    if($exit != 0 && $exit >> 8 != 124) {
+      die "Error running $psicov_cmd (exit: $exit)\n";
+    }
+
+    my $ccm_cmd = [
+      "timeout", "86400",
+      "$bin_dir/ccmpred", -t => 6,
+      "$tempdir/$prefix.aln", "$tempdir/$prefix.ccmpred"];
+
+    if(!(-s "$tempdir/$prefix.ccmpred")) {
+      ($stdout, $stderr, $exit) = run($ccm_cmd, ignore_exitval => 1);
+      if($exit != 0 && $exit >> 8 != 124) {
+        die "Error running $psicov_cmd (exit: $exit)\n";
+      }
+    }
+
+    run(["$bin_dir/freecontact",
+        -a => 8, -f => "$tempdir/$prefix.aln",
+      ], redirect => "$tempdir/$prefix.evfold");
+  }
+
+  #exit 0;
+  print("Running: meta-prediction\n");
+  run(["touch",
+      "$tempdir/$prefix.psicov",
+      "$tempdir/$prefix.evfold",
+      "$tempdir/$prefix.ccmpred"]);
+
+  my $metapsicov_cmd = ["$bin_dir/metapsicov",
+    "$tempdir/$prefix.colstats", "$tempdir/$prefix.pairstats",
+    "$tempdir/$prefix.psicov", "$tempdir/$prefix.evfold",
+    "$tempdir/$prefix.ccmpred", "$tempdir/$prefix.ss2",
+    "$tempdir/$prefix.solv",
+    "$share_dir/metapsicov/data/weights_6A.dat",
+    "$share_dir/metapsicov/data/weights_65A.dat",
+    "$share_dir/metapsicov/data/weights_7A.dat",
+    "$share_dir/metapsicov/data/weights_75A.dat",
+    "$share_dir/metapsicov/data/weights_8A.dat",
+    "$share_dir/metapsicov/data/weights_85A.dat",
+    "$share_dir/metapsicov/data/weights_9A.dat",
+    "$share_dir/metapsicov/data/weights_10A.dat",
+    "$share_dir/metapsicov/data/weights_811A.dat",
+    "$share_dir/metapsicov/data/weights_1012A.dat"];
+  run($metapsicov_cmd, redirect => "$tempdir/$prefix.metapsicov.stage1");
+
+
+  my $metapsicovp2_cmd = ["$bin_dir/metapsicovp2 "
+    . "$tempdir/$prefix.colstats "
+    . "$tempdir/$prefix.metapsicov.stage1 "
+    . "$tempdir/$prefix.ss2 "
+    . "$tempdir/$prefix.solv "
+    . "$share_dir/metapsicov/data/weights_pass2.dat "
+    . "| sort -n -r -k 5 | head -5000"];
+  run($metapsicovp2_cmd, redirect => "$tempdir/$prefix.metapsicov.stage2");
+}
+
+if(! -e $tempdir)
+{
+  die("tempdir $tempdir does not exist, please create.");
+}
+
+
+copy($query_seq, "$tempdir/$jobid.fasta");
+
+open my $seqfile, q{<}, "$tempdir/$jobid.fasta";
+my $seq = do { local $/ = undef; <$seqfile> };
+$seq =~ s/>.*\n//;
+$seq =~ s/[^A-za-z]//g;
+close $seqfile;
+
+my $nres = length($seq);
+my $masked = $seq;
+
+print("Running: initial hhblits\n");
+run(["$bin_dir/hhblits",
+        -i => "$tempdir/$jobid.fasta",
+        -n => 3, -e => 0.001,
+        -d => $pdb70,
+        -cpu => $options{cpu},
+        -o => "$tempdir/$jobid.hhr"
+     ], redirect => "$tempdir/$jobid.pdbhhblog");
+
+open my $hhrfile, q{<}, "$tempdir/$jobid.hhr";
+while (<$hhrfile>)
+{
+  if (/^..[0-9] /)
+  {
+    my @recs = split(' ', substr($_, 34));
+    if ($recs[0] >= 98.0)
+    {
+      my @range = split('-', $recs[6]);
+      #print $range[0]-1, "-", $range[1]-1, "\n";
+      for (my $i = $range[0]-1; $i <= $range[1]-1; $i++)
+      {
+        substr($masked, $i, 1) = ' ';
+      }
+      #print $range[0], " ", $range[1], "\n";
+    }
+  }
+  if (/^>/)
+  {
+    last;
+  }
+}
+close $hhrfile;
+
+# First run complete sequence
+RunMetaPSICOV($jobid);
+
+open my $s2file, q{<}, "$tempdir/$jobid.metapsicov.stage2";
+while (<$s2file>)
+{
+    my @recs = split(' ');
+    $contacts[$recs[0]][$recs[1]] = $recs[4];
+}
+close $s2file;
+
+# Now run detected domains (if any) that could not be matched to PDB templates
+while ($masked =~ /([A-Za-z]+)/g)
+{
+  my $domlen = length($1);
+  my $roffset = pos($masked) - $domlen;
+  my $domseq = $1;
+
+  if (length($domseq) >= 30 && length($domseq) < $nres)
+  {
+    open my $domsout, q{>}, "$tempdir/$jobid.$roffset.fasta";
+    print {$domsout} ">Domain$roffset\n$domseq\n";
+    close $domsout;
+
+    RunMetaPSICOV("$jobid.$roffset");
+
+    # Erase any previously predicted contacts within this domain
+    for (my $i=$roffset+1; $i<=$roffset+$domlen; $i++)
+    {
+      for (my $j=$i+1; $j<=$roffset+$domlen; $j++)
+      {
+        $contacts[$i][$j] = 0.0;
+      }
+    }
+
+    # Copy in newly predicted contacts for this domain
+    open $s2file, q{<}, "$tempdir/$jobid.$roffset.metapsicov.stage2";
+    while (<$s2file>)
+    {
+      my @recs = split(' ');
+      $contacts[$recs[0] + $roffset][$recs[1] + $roffset] = $recs[4];
+    }
+    close $s2file;
+  }
+}
+
+open my $s3file, q{>}, "$tempdir/$jobid.metapsicov.stage3";
+for (my $i=1; $i<=$nres; $i++)
+{
+  for (my $j=$i+5; $j<=$nres; $j++)
+  {
+    my $prob = $contacts[$i][$j];
+    if (defined($prob) && $prob > 0.0)
+    {
+      print {$s3file} "$i $j 0 8 $prob\n";
+    }
+  }
+}
+close $s3file;
+
+# $message = "PFRMAT RR\nTARGET " . $subject . "\nAUTHOR MetaPSICOV\nMODEL 1\n";
+# $subjectline = $subject . " MetaPSICOV Results";
+# open(MAILOUT, "| /usr/bin/Mail -s '$subjectline' $email") or die;
+# print MAILOUT $message;
+#
+# $Text::Wrap::columns = 50;
+# open(SEQFILE, "$tempdir/$jobid.fasta");
+# <SEQFILE>;
+# print MAILOUT Text::Wrap::fill( '', '', join '', <SEQFILE>);
+# close SEQFILE;
+# print MAILOUT "\n";
+#
+# $results = `cat $tempdir/$jobid.metapsicov.stage3 | sort -n -r -k 5 | head -5000`;
+# print MAILOUT $results, "END\n";
+#
+# close(MAILOUT);
+#
+# if (open(LOGF, ">>/var/www/tmp/consip.log")) {
+#     flock(LOGF, 2) or die;
+#     $date = localtime;
+#     print LOGF $date," : COMPLETED $jobid\n";
+#     close(LOGF);
+# }
+
+exit 0;
