@@ -9,7 +9,7 @@ a meta-tool for predicting residue-residue contacts from correlated mutations.
 
 ## Building
 
-You should be able to build this package by simply running `conda build .`.
+You should be able to build this package by simply running `./build`.
 
 ## Patches
 
